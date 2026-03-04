@@ -1,0 +1,52 @@
+services:
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333' 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  ingest:
+    build: .
+    command: python -m src.ingestion.indexer
+    env_file: .env
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - PDF_PATH=data/guia_nacional_notificacion_gestion_ciberincidentes.pdf
+      - OCR_MODEL=gpt-5.2-2025-12-11
+      - MARKDOWN_CACHE_DIR=data/markdown_cache
+      - OCR_CONCURRENCY=5
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build: .
+    command: python -m src.ui.app
+    ports:
+      - "7860:7860"
+    env_file: .env
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      ingest:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
