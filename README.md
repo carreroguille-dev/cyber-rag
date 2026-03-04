@@ -1,73 +1,73 @@
 # Cyber-RAG — Asistente IA sobre la Guía Nacional de Ciberincidentes
 
-Agentic RAG system over the **Guía Nacional de Notificación y Gestión de Ciberincidentes** (Consejo Nacional de Ciberseguridad, Spain, 2020). Ask questions about incident classification, notification deadlines, responsible authorities, procedures, and glossary terms — all grounded exclusively in the document.
+Sistema RAG agéntico sobre la **Guía Nacional de Notificación y Gestión de Ciberincidentes** (Consejo Nacional de Ciberseguridad, 2020). Permite consultar clasificación de incidentes, plazos de notificación, organismos responsables, procedimientos y términos del glosario, con respuestas fundamentadas exclusivamente en el documento.
 
 ---
 
-## Overview
+## Descripción general
 
 ```
-User question → Guardrail → Semantic Cache → ReAct Agent → Qdrant → Grounded answer
+Pregunta del usuario → Guardrail → Caché semántica → Agente ReAct → Qdrant → Respuesta fundamentada
 ```
 
-The system never answers from general knowledge. Every claim is backed by a retrieved chunk and cited with section and page number. If the information is not in the document, it says so explicitly.
+El sistema nunca responde desde conocimiento general. Cada afirmación está respaldada por un fragmento recuperado y citada con sección y número de página. Si la información no está en el documento, lo indica explícitamente.
 
 ---
 
-## High-Level Architecture
+## Arquitectura general
 
 ```mermaid
 flowchart TD
-    User([User]) -->|query| UI[Gradio Chat UI\nport 7860]
+    User([Usuario]) -->|pregunta| UI[Interfaz Gradio\npuerto 7860]
 
-    UI --> GR[Guardrail\n2-layer filter]
+    UI --> GR[Guardrail\nfiltro 2 capas]
     GR -->|REJECT| UI
-    GR -->|PASS| CACHE[Semantic Cache\nQdrant qa_cache]
+    GR -->|PASS| CACHE[Caché semántica\nQdrant qa_cache]
 
-    CACHE -->|HIT — cached answer| UI
-    CACHE -->|MISS| AGENT[ReAct Agent\ngpt-5.1]
+    CACHE -->|HIT — respuesta cacheada| UI
+    CACHE -->|MISS| AGENT[Agente ReAct\ngpt-5.1]
 
-    AGENT <-->|tool calls| TOOLS[5 Retrieval Tools]
-    TOOLS <-->|vector search| QDRANT[(Qdrant\nguia_chunks)]
+    AGENT <-->|tool calls| TOOLS[5 Herramientas de recuperación]
+    TOOLS <-->|búsqueda vectorial| QDRANT[(Qdrant\nguia_chunks)]
 
-    AGENT -->|raw answer| SYNTH[Synthesizer\nconfidence score]
-    SYNTH -->|clean answer + metadata| CACHE
-    CACHE -->|store| QDRANT
+    AGENT -->|respuesta bruta| SYNTH[Sintetizador\npuntuación de confianza]
+    SYNTH -->|respuesta limpia + metadatos| CACHE
+    CACHE -->|almacenar| QDRANT
     SYNTH --> UI
 
-    subgraph Ingestion["Ingestion Pipeline (one-time)"]
-        PDF[PDF\n55 pages] --> RENDER[PyMuPDF\npage → PNG]
-        RENDER --> OCR[gpt-5.2-2025-12-11\nVision OCR]
-        OCR --> DISK[(Disk Cache\ndata/markdown_cache/)]
-        DISK --> CHUNK[Markdown Chunker\n212 chunks]
-        CHUNK --> EMBED[text-embedding-3-small\n+ sparse BM25]
+    subgraph Ingesta["Pipeline de Ingesta (una sola vez)"]
+        PDF[PDF\n55 páginas] --> RENDER[PyMuPDF\npágina → PNG]
+        RENDER --> OCR[gpt-5.2-2025-12-11\nOCR por visión]
+        OCR --> DISK[(Caché en disco\ndata/markdown_cache/)]
+        DISK --> CHUNK[Chunker de Markdown\n212 chunks]
+        CHUNK --> EMBED[text-embedding-3-small\n+ BM25 sparse]
         EMBED --> QDRANT
     end
 ```
 
 ---
 
-## Ingestion Pipeline
+## Pipeline de ingesta
 
-The pipeline converts a PDF into a searchable vector index. It is run once; subsequent starts use the Qdrant volume and markdown cache — no API calls needed.
+El pipeline convierte el PDF en un índice vectorial consultable. Se ejecuta una sola vez; los arranques posteriores usan el volumen de Qdrant y la caché de markdown sin ninguna llamada a la API.
 
 ```mermaid
 flowchart LR
-    PDF[PDF file] --> A
+    PDF[Fichero PDF] --> A
 
-    subgraph A["1 · Render (pdf_renderer.py)"]
+    subgraph A["1 · Renderizado (pdf_renderer.py)"]
         direction TB
-        pymupdf[PyMuPDF\ndpi=150] --> pages["list of\n(page_num, PNG bytes)"]
+        pymupdf[PyMuPDF\ndpi=150] --> pages["lista de\n(num_página, bytes PNG)"]
     end
 
     A --> B
 
-    subgraph B["2 · Vision OCR (ocr.py)"]
+    subgraph B["2 · OCR por visión (ocr.py)"]
         direction TB
-        check{Cache hit?}
-        check -->|yes| md_disk["Read .md from\ndata/markdown_cache/"]
-        check -->|no| vision["gpt-5.2-2025-12-11\nvision API\nmax_completion_tokens=2048"]
-        vision --> save["Save to\npage_NNN.md"]
+        check{¿Caché hit?}
+        check -->|sí| md_disk["Leer .md desde\ndata/markdown_cache/"]
+        check -->|no| vision["gpt-5.2-2025-12-11\nAPI de visión\nmax_completion_tokens=2048"]
+        vision --> save["Guardar en\npage_NNN.md"]
         save --> md_disk
     end
 
@@ -75,147 +75,147 @@ flowchart LR
 
     subgraph C["3 · Chunking (chunker.py)"]
         direction TB
-        assemble["Assemble full markdown\nwith page markers"] --> split
-        split["Split on H1/H2\nheadings"] --> detect
+        assemble["Ensamblar markdown completo\ncon marcadores de página"] --> split
+        split["Dividir en headings\nH1/H2"] --> detect
 
-        detect{Section type?}
-        detect -->|"density of **Term**: > 25%"| glos["One chunk\nper glossary entry\nglosario.term_id"]
-        detect -->|"contains |---|"| tables["Narrative chunks +\none chunk per table\ncaption normalized to Tabla N"]
-        detect -->|otherwise| narr["H3 sub-split\nthen token windows\n400 tok / 50 overlap"]
+        detect{Tipo de sección}
+        detect -->|"densidad de **Término**: > 25%"| glos["Un chunk\npor entrada de glosario\nglosario.term_id"]
+        detect -->|"contiene |---|"| tables["Chunks narrativos +\nun chunk por tabla\ncaption normalizado a Tabla N"]
+        detect -->|en otro caso| narr["Sub-división por H3\nluego ventanas de tokens\n400 tok / 50 solapamiento"]
     end
 
     C --> D
 
-    subgraph D["4 · Indexing (indexer.py)"]
+    subgraph D["4 · Indexación (indexer.py)"]
         direction TB
-        emb["text-embedding-3-small\n1536 dims"] --> sparse["BM25 sparse vector\nhash trick MD5 % 30000"]
-        sparse --> upsert["Qdrant upsert\nbatch=10"]
+        emb["text-embedding-3-small\n1536 dims"] --> sparse["Vector sparse BM25\nhash trick MD5 % 30000"]
+        sparse --> upsert["Qdrant upsert\nlotes de 10"]
     end
 ```
 
-### Chunk metadata
+### Metadatos de cada chunk
 
-Every chunk stored in Qdrant carries:
+Cada chunk almacenado en Qdrant incluye:
 
-| Field | Description |
+| Campo | Descripción |
 |---|---|
-| `chunk_id` | Unique ID, e.g. `sec_6_1_0`, `glosario.ransomware` |
-| `seccion` | Structural number: `"6"`, `"6.1"`, `"A1"` |
-| `subseccion` | Subsection number when applicable |
-| `titulo_seccion` | Human-readable heading |
-| `pagina_inicio / pagina_fin` | Page range in the PDF |
+| `chunk_id` | ID único, p. ej. `sec_6_1_0`, `glosario.ransomware` |
+| `seccion` | Número estructural: `"6"`, `"6.1"`, `"A1"` |
+| `subseccion` | Número de subsección cuando aplica |
+| `titulo_seccion` | Encabezado legible por humanos |
+| `pagina_inicio / pagina_fin` | Rango de páginas en el PDF |
 | `tipo_contenido` | `narrative`, `table`, `glossary_term`, `procedure`, `criteria_list`, `legal_reference` |
-| `tabla` | Normalized caption `"Tabla N"` for table chunks |
-| `termino_glosario` | Term string for glossary chunks |
+| `tabla` | Caption normalizado `"Tabla N"` para chunks de tabla |
+| `termino_glosario` | Término para chunks de glosario |
 | `ambito` | `general`, `sector_publico`, `infraestructuras_criticas`, … |
-| `terminos_clave` | Top-8 keywords by frequency |
+| `terminos_clave` | Top-8 palabras clave por frecuencia |
 
 ---
 
-## Guardrail System
+## Sistema de Guardrail
 
-Every user message passes through a two-layer filter before reaching the agent. The guardrail is fail-open for ambiguous or off-topic questions — relevance filtering is the agent's job, not the guardrail's.
+Cada mensaje del usuario pasa por un filtro de dos capas antes de llegar al agente. El guardrail es permisivo ante preguntas ambiguas o fuera de tema — filtrar por relevancia es tarea del agente, no del guardrail.
 
 ```mermaid
 flowchart TD
-    Q([User query]) --> L1
+    Q([Pregunta del usuario]) --> L1
 
-    subgraph L1["Layer 1 — Deterministic Rules (rules.py)  ·  ~0 ms"]
-        len{2–600 words?}
-        len -->|no| block1[BLOCK\nINVALID_LENGTH]
-        len -->|yes| inj{Injection pattern\nregex match?}
-        inj -->|yes| block2[BLOCK\nINJECTION_PATTERN]
-        inj -->|no| pass1[PASS → Layer 2]
+    subgraph L1["Capa 1 — Reglas deterministas (rules.py)  ·  ~0 ms"]
+        len{¿2–600 palabras?}
+        len -->|no| block1[BLOQUEAR\nINVALID_LENGTH]
+        len -->|sí| inj{¿Coincide patrón\nde inyección?}
+        inj -->|sí| block2[BLOQUEAR\nINJECTION_PATTERN]
+        inj -->|no| pass1[PASS → Capa 2]
     end
 
-    subgraph L2["Layer 2 — LLM Classifier (classifier.py)  ·  ~300 ms"]
+    subgraph L2["Capa 2 — Clasificador LLM (classifier.py)  ·  ~300 ms"]
         nano["gpt-5-nano\nJSON: decision + razon\nmax_completion_tokens=80"]
-        nano -->|REJECT| block3[BLOCK]
+        nano -->|REJECT| block3[BLOQUEAR]
         nano -->|PASS| pass2[PASS → Pipeline]
     end
 
     L1 --> L2
 ```
 
-**Layer 1** checks 14 regex patterns (jailbreak keywords, prompt-injection tokens, system-prompt extraction attempts) and enforces a word-count range. Zero LLM cost.
+**Capa 1** comprueba 14 patrones regex (palabras clave de jailbreak, tokens de prompt-injection, intentos de extracción del system prompt) y valida el rango de longitud. Coste cero de LLM.
 
-**Layer 2** sends the query to `gpt-5-nano` with a strict system prompt that only detects manipulation attempts — not off-topic content. Returns only `PASS` or `REJECT`.
+**Capa 2** envía la consulta a `gpt-5-nano` con un system prompt estricto que solo detecta intentos de manipulación, no contenido fuera de tema. Devuelve únicamente `PASS` o `REJECT`.
 
-Both layers return the same opaque rejection message so as not to reveal which layer blocked the query.
+Ambas capas devuelven el mismo mensaje de rechazo opaco para no revelar qué capa bloqueó la consulta.
 
 ---
 
-## Semantic Cache
+## Caché semántica
 
-Before calling the (expensive) agent, the system checks whether a semantically similar question was already answered.
+Antes de invocar al agente (costoso), el sistema comprueba si una pregunta semánticamente similar ya fue respondida.
 
 ```mermaid
 flowchart LR
-    Q[Query] --> emb[text-embedding-3-small]
-    emb --> search["Qdrant query_points\nqa_cache collection\nusing=dense"]
-    search --> thresh{cosine ≥ 0.92?}
-    thresh -->|HIT| return[Return cached answer\nincrement frecuencia_hits]
-    thresh -->|MISS| agent[Call Agent]
-    agent --> store["cache_store()\nqdrant upsert\nvector={'dense': embedding}"]
+    Q[Consulta] --> emb[text-embedding-3-small]
+    emb --> search["Qdrant query_points\ncolección qa_cache\nusing=dense"]
+    search --> thresh{coseno ≥ 0.92?}
+    thresh -->|HIT| return[Devolver respuesta cacheada\nincrementar frecuencia_hits]
+    thresh -->|MISS| agent[Llamar al Agente]
+    agent --> store["cache_store()\nQdrant upsert\nvector={'dense': embedding}"]
 ```
 
-The cache collection (`qa_cache`) uses the same `text-embedding-3-small` embeddings as the main index. A threshold of **0.92** is conservative enough to avoid false hits on semantically close but distinct questions.
+La colección de caché (`qa_cache`) usa los mismos embeddings `text-embedding-3-small` que el índice principal. Un umbral de **0.92** es suficientemente conservador para evitar falsos aciertos en preguntas semánticamente próximas pero distintas.
 
 ---
 
-## ReAct Agent
+## Agente ReAct
 
-The agent follows a **Reason → Act → Observe** loop using OpenAI tool calling. It has access to 5 retrieval tools and a maximum of 8 tool calls per query.
+El agente sigue un bucle **Razonar → Actuar → Observar** usando tool calling de OpenAI. Dispone de 5 herramientas de recuperación y un máximo de 8 llamadas a herramientas por consulta.
 
 ```mermaid
 flowchart TD
-    Q[User query] --> sys[System prompt\n+ user message]
+    Q[Pregunta del usuario] --> sys[System prompt\n+ mensaje de usuario]
     sys --> llm["gpt-5.1\nmax_completion_tokens=2048\ntimeout=90s"]
 
-    llm -->|finish_reason=stop| synth[Synthesizer]
-    llm -->|tool_calls| batch["Execute full\ntool call batch\none-by-one"]
+    llm -->|finish_reason=stop| synth[Sintetizador]
+    llm -->|tool_calls| batch["Ejecutar lote completo\nde tool calls\nuno a uno"]
 
-    batch --> append["Append tool results\nto messages history"]
+    batch --> append["Añadir resultados de tools\nal historial de mensajes"]
     append --> check{tool_calls_count\n≥ 8?}
     check -->|no| llm
-    check -->|yes| force["Force final answer\n'respond with what you have'"]
-    force --> llm2["gpt-5.1\nfinal call"] --> synth
+    check -->|yes| force["Forzar respuesta final\n'responde con lo que tienes'"]
+    force --> llm2["gpt-5.1\nllamada final"] --> synth
 
-    subgraph synth["Synthesizer (synthesizer.py)"]
-        clean[Clean whitespace] --> conf
-        conf["Confidence score\n1.0 cited + chunks\n0.8 chunks no cite\n0.5 no chunks\n0.0 'not covered'"]
+    subgraph synth["Sintetizador (synthesizer.py)"]
+        clean[Limpiar espacios] --> conf
+        conf["Puntuación de confianza\n1.0 citas + chunks\n0.8 chunks sin citar\n0.5 sin chunks\n0.0 'no cubierto'"]
     end
 ```
 
-### Retrieval Tools
+### Herramientas de recuperación
 
-| Tool | When to use | Implementation |
+| Herramienta | Cuándo usarla | Implementación |
 |---|---|---|
-| `hybrid_search` | Default first action for most queries | Dense + BM25 RRF fusion, optional section/type filters |
-| `get_table` | Questions involving a numbered table | Scroll by `tabla == "Tabla N"` |
-| `get_section` | Need full view of a section | Scroll by `seccion` or `subseccion` field |
-| `get_context_window` | Need context around a specific chunk | Page-proximity search `±window` pages |
-| `glossary_lookup` | Meaning of a technical term | Match/partial search on `termino_glosario` field |
+| `hybrid_search` | Primera acción por defecto en la mayoría de consultas | Fusión RRF dense + BM25, filtros opcionales de sección/tipo |
+| `get_table` | Preguntas que involucran una tabla numerada | Scroll por `tabla == "Tabla N"` |
+| `get_section` | Vista completa de una sección | Scroll por campo `seccion` o `subseccion` |
+| `get_context_window` | Contexto alrededor de un chunk específico | Búsqueda por proximidad de página `±window` páginas |
+| `glossary_lookup` | Significado de un término técnico | Búsqueda exacta/parcial en campo `termino_glosario` |
 
-### Hybrid Search
+### Búsqueda híbrida
 
 ```mermaid
 flowchart LR
-    Q[Query text] --> norm[Normalize\nlowercase, expand abbrevs]
-    norm --> dense[text-embedding-3-small\n1536-dim dense vector]
-    norm --> sparse["BM25 sparse vector\nhash trick: MD5(term) % 30000\nnormalized term frequency"]
+    Q[Texto de consulta] --> norm[Normalizar\nminúsculas, expandir abreviaturas]
+    norm --> dense[text-embedding-3-small\nvector denso 1536 dims]
+    norm --> sparse["Vector sparse BM25\nhash trick: MD5(término) % 30000\nfrecuencia de término normalizada"]
 
     dense --> prefetch1["Qdrant Prefetch\nusing=dense\nlimit=20"]
     sparse --> prefetch2["Qdrant Prefetch\nusing=bm25\nlimit=20"]
 
     prefetch1 --> rrf["Reciprocal Rank Fusion\nFusion.RRF"]
     prefetch2 --> rrf
-    rrf --> top["Top-k chunks\nwith payload"]
+    rrf --> top["Top-k chunks\ncon payload"]
 ```
 
 ---
 
-## Qdrant Collections
+## Colecciones de Qdrant
 
 ```mermaid
 erDiagram
@@ -253,38 +253,38 @@ erDiagram
     }
 ```
 
-Both collections use **named vectors** (`vectors_config={"dense": VectorParams(...)}`). `guia_chunks` additionally has a sparse `bm25` named vector for hybrid search.
+Ambas colecciones usan **vectores con nombre** (`vectors_config={"dense": VectorParams(...)}`). `guia_chunks` incorpora además un vector sparse `bm25` para la búsqueda híbrida.
 
 ---
 
-## Project Structure
+## Estructura del proyecto
 
 ```
 cyber-rag/
 ├── data/
 │   ├── guia_nacional_notificacion_gestion_ciberincidentes.pdf
-│   └── markdown_cache/          # OCR cache — page_001.md … page_055.md
+│   └── markdown_cache/          # Caché OCR — page_001.md … page_055.md
 ├── src/
 │   ├── ingestion/
-│   │   ├── pdf_renderer.py      # PDF → PNG pages (PyMuPDF)
-│   │   ├── ocr.py               # PNG → Markdown (gpt-5.2 vision + disk cache)
-│   │   ├── chunker.py           # Markdown → Chunk objects
-│   │   └── indexer.py           # Orchestrator: OCR → chunk → embed → upsert
+│   │   ├── pdf_renderer.py      # PDF → páginas PNG (PyMuPDF)
+│   │   ├── ocr.py               # PNG → Markdown (gpt-5.2 visión + caché disco)
+│   │   ├── chunker.py           # Markdown → objetos Chunk
+│   │   └── indexer.py           # Orquestador: OCR → chunk → embed → upsert
 │   ├── retrieval/
-│   │   └── qdrant_client.py     # 5 query types + hybrid search + sparse vector
+│   │   └── qdrant_client.py     # 5 tipos de consulta + búsqueda híbrida + vector sparse
 │   ├── guardrail/
-│   │   ├── __init__.py          # Unified guardrail() with timing logs
-│   │   ├── rules.py             # Layer 1: regex + length
-│   │   └── classifier.py        # Layer 2: gpt-5-nano PASS/REJECT
+│   │   ├── __init__.py          # guardrail() unificado con logs de timing
+│   │   ├── rules.py             # Capa 1: regex + longitud
+│   │   └── classifier.py        # Capa 2: gpt-5-nano PASS/REJECT
 │   ├── cache/
-│   │   └── semantic_cache.py    # Lookup + store + TTL invalidation
+│   │   └── semantic_cache.py    # Lookup + almacenamiento + invalidación por TTL
 │   ├── agent/
-│   │   ├── agent.py             # ReAct loop (gpt-5.1, max 8 tool calls)
-│   │   ├── tools.py             # Tool definitions + execute_tool dispatcher
-│   │   └── synthesizer.py       # Response cleanup + confidence score
+│   │   ├── agent.py             # Bucle ReAct (gpt-5.1, máx. 8 tool calls)
+│   │   ├── tools.py             # Definiciones de tools + despachador execute_tool
+│   │   └── synthesizer.py       # Limpieza de respuesta + puntuación de confianza
 │   └── ui/
-│       └── app.py               # Gradio chat interface
-├── docs/                        # Design documents
+│       └── app.py               # Interfaz de chat Gradio
+├── docs/                        # Documentos de diseño
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -292,63 +292,63 @@ cyber-rag/
 
 ---
 
-## Stack
+## Tecnologías
 
-| Component | Technology |
+| Componente | Tecnología |
 |---|---|
-| LLM — agent | `gpt-5.1` |
-| LLM — OCR | `gpt-5.2-2025-12-11` (vision) |
+| LLM — agente | `gpt-5.1` |
+| LLM — OCR | `gpt-5.2-2025-12-11` (visión) |
 | LLM — guardrail | `gpt-5-nano` |
 | Embeddings | `text-embedding-3-small` (1536 dims) |
-| Vector DB | Qdrant (dense + sparse named vectors) |
-| PDF rendering | PyMuPDF |
-| UI | Gradio 6 |
-| Runtime | Python 3.11, Docker |
+| Base de datos vectorial | Qdrant (vectores densos + sparse con nombre) |
+| Renderizado de PDF | PyMuPDF |
+| Interfaz de usuario | Gradio 6 |
+| Entorno de ejecución | Python 3.11, Docker |
 
 ---
 
-## Quick Start
+## Inicio rápido
 
-**Prerequisites:** Docker, an OpenAI API key, and the PDF placed in `data/`.
+**Requisitos previos:** Docker, una clave de API de OpenAI y el PDF en `data/`.
 
 ```bash
-# 1. Clone and configure
+# 1. Configurar credenciales
 cp .env.example .env
-# Edit .env and set OPENAI_API_KEY=sk-...
+# Editar .env y establecer OPENAI_API_KEY=sk-...
 
-# 2. Place the PDF
+# 2. Colocar el PDF
 # data/guia_nacional_notificacion_gestion_ciberincidentes.pdf
 
-# 3. First run — ingests the document (OCR + embed, ~5 min first time)
+# 3. Primera ejecución — ingesta el documento (OCR + embeddings, ~5 min la primera vez)
 docker compose up --build
 
-# 4. Subsequent starts — uses cached markdown and Qdrant volume (instant)
+# 4. Arranques posteriores — usa la caché de markdown y el volumen de Qdrant (instantáneo)
 docker compose up
 
-# UI available at http://localhost:7860
+# Interfaz disponible en http://localhost:7860
 ```
 
-### Environment Variables
+### Variables de entorno
 
-| Variable | Default | Description |
+| Variable | Por defecto | Descripción |
 |---|---|---|
-| `OPENAI_API_KEY` | — | **Required** |
-| `PDF_PATH` | `data/guia_nacional_notificacion_gestion_ciberincidentes.pdf` | Path to source PDF |
-| `OCR_MODEL` | `gpt-5.2-2025-12-11` | Vision model for OCR |
-| `OCR_CONCURRENCY` | `5` | Parallel OCR requests |
-| `MARKDOWN_CACHE_DIR` | `data/markdown_cache` | OCR cache directory |
-| `QDRANT_HOST` | `localhost` | Qdrant hostname |
-| `QDRANT_PORT` | `6333` | Qdrant port |
+| `OPENAI_API_KEY` | — | **Obligatoria** |
+| `PDF_PATH` | `data/guia_nacional_notificacion_gestion_ciberincidentes.pdf` | Ruta al PDF fuente |
+| `OCR_MODEL` | `gpt-5.2-2025-12-11` | Modelo de visión para OCR |
+| `OCR_CONCURRENCY` | `5` | Peticiones OCR en paralelo |
+| `MARKDOWN_CACHE_DIR` | `data/markdown_cache` | Directorio de caché OCR |
+| `QDRANT_HOST` | `localhost` | Hostname de Qdrant |
+| `QDRANT_PORT` | `6333` | Puerto de Qdrant |
 
-### Re-ingesting
+### Re-ingesta
 
-The OCR cache means only the embedding API is called on re-ingest:
+La caché OCR hace que en una re-ingesta solo se llame a la API de embeddings:
 
 ```bash
-# Full re-ingest (re-embeds all chunks, resets Qdrant collection)
+# Re-ingesta completa (re-embebe todos los chunks, reinicia la colección Qdrant)
 docker compose run --rm ingest
 
-# Force re-OCR of all pages (delete cache first)
+# Forzar re-OCR de todas las páginas (borrar caché primero)
 rm -rf data/markdown_cache/
 docker compose run --rm ingest
 ```
