@@ -183,8 +183,7 @@ openai_client = AsyncOpenAI()
 async def capa2(query: str) -> dict:
     response = await openai_client.chat.completions.create(
         model="gpt-5-nano",
-        max_tokens=80,
-        temperature=0.0,
+        max_completion_tokens=80,
         messages=[
             {"role": "system", "content": GUARDRAIL_SYSTEM_PROMPT},
             {"role": "user", "content": query}

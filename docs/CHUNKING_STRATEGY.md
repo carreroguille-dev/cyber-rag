@@ -1,244 +1,236 @@
 # CHUNKING STRATEGY
-## Fragmentación del PDF — Guía Nacional de Ciberincidentes
+## Pipeline de Ingesta — OCR por Visión + Chunker Agnóstico
 
 ---
 
 ## 1. Principio Fundamental
 
-**No fragmentar por tokens. Fragmentar por unidades semánticas del documento.**
+**No hardcodear la estructura del documento. Detectarla automáticamente desde el Markdown.**
 
-El chunking clásico (ventana deslizante de N tokens con overlap) destruye las tablas normativas, separa los criterios de sus definiciones, y rompe las referencias cruzadas que son el núcleo de este documento. Cada chunk debe ser una unidad de conocimiento completa y autocontenida.
+La estrategia original dividía el PDF en chunks predefinidos por sección (94 chunks hardcodeados para la estructura exacta de la Guía Nacional). Ese enfoque es frágil: cualquier actualización del PDF requiere reescribir el chunker.
+
+La estrategia actual usa visión para convertir cada página a Markdown y luego detecta automáticamente el tipo de contenido por estructura sintáctica. El chunker es agnóstico al documento: funciona con cualquier PDF procesado por el mismo pipeline OCR.
 
 ---
 
-## 2. Mapa de Tipos de Contenido
+## 2. Pipeline Completo
 
-Antes de definir la estrategia, se identifican los 6 tipos de contenido presentes en el PDF y su tratamiento diferenciado:
+```
+PDF
+ └─► PyMuPDF: render página → PNG (dpi=150)
+      └─► gpt-5.2-2025-12-11 vision: PNG → Markdown   [caché en disco]
+           └─► Ensamblar documento completo con marcadores <!-- page N -->
+                └─► Dividir en secciones H1/H2
+                     └─► Detectar tipo de sección
+                          ├─► Glosario  → un chunk por entrada **Término**:
+                          ├─► Con tabla → chunk(s) narrativos + chunk por tabla
+                          └─► Narrativo → sub-dividir en H3, luego ventana de tokens
+```
 
-| Tipo | Ejemplos en el PDF | Estrategia |
+---
+
+## 3. Módulos
+
+### `pdf_renderer.py` — PDF → PNG
+
+```python
+import fitz  # PyMuPDF
+
+def render_pages(pdf_path: str, dpi: int = 150) -> list[tuple[int, bytes]]:
+    """Devuelve lista de (num_página_1indexed, png_bytes)."""
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i, page in enumerate(doc):
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+        pages.append((i + 1, pix.tobytes("png")))
+    doc.close()
+    return pages
+```
+
+`dpi=150` equilibra calidad de imagen y coste de tokens para el modelo de visión.
+
+### `ocr.py` — PNG → Markdown con caché en disco
+
+```python
+OCR_PROMPT = """Convert this PDF page to clean markdown. Rules:
+- Headings: use # for main sections, ## for subsections, ### for sub-subsections
+- Tables: use standard markdown table syntax (| col | col |\n|---|---|)
+- Lists: use - for bullets, 1. for numbered
+- Bold terms in glossary: **Term**: definition
+- Preserve ALL text content exactly as it appears
+- Output ONLY the markdown, no commentary"""
+```
+
+El OCR guarda cada página como `data/markdown_cache/page_NNN.md`. En re-ingestas, las páginas cacheadas se leen desde disco — cero llamadas al modelo de visión.
+
+Concurrencia configurable con `OCR_CONCURRENCY` (por defecto 5 páginas en paralelo).
+
+### `chunker.py` — Markdown → objetos Chunk
+
+**Detección de tipo de sección:**
+
+| Criterio de detección | Tipo asignado | Estrategia de sub-chunking |
 |---|---|---|
-| `narrative` | Secciones 1, 2, 3, intro de secciones | Chunk por subsección, máx. 1000 tokens |
-| `table` | Tablas 3-13 | Un chunk por tabla completa, nunca fragmentar |
-| `procedure` | Ventanilla única (Sec. 4), fases gestión (Sec. 7) | Chunk por paso/fase, con contexto del procedimiento |
-| `criteria_list` | Listas de criterios de peligrosidad/impacto | Un chunk por nivel completo |
-| `glossary_term` | Anexo 5 (~40 términos) | Un chunk por término con su definición completa |
-| `legal_reference` | Anexo 4 (Marco Regulador) | Un chunk por categoría legal |
+| Densidad de `**Término**:` > 25% de líneas | `glossary_term` | Un chunk por entrada `**Término**: definición` |
+| Contiene `\|---\|` (tabla Markdown) | `table` + `narrative` | Un chunk por tabla + chunks narrativos adyacentes |
+| En otro caso | `narrative` | Sub-dividir en H3, luego ventana deslizante 400 tok / 50 overlap |
 
----
+**Puntos clave de la implementación:**
 
-## 3. Estrategia por Sección del Documento
+- `_assemble_with_page_markers(pages)`: inserta `<!-- page N -->` entre páginas para rastrear origen
+- `_split_by_headings(md, levels=[1,2])`: divide en secciones en cada `# ` o `## ` que empieza línea
+- `_extract_table_caption(body, table_start, table_end)`: busca el pie de tabla **después** del bloque `|---|` (convención española en documentos normativos) y devuelve solo `"Tabla N"` normalizado
+- `_is_glossary(section)`: comprueba que `^[-\s]*\*{1,2}[^*\n]+\*{1,2}:` esté en ≥25% de las líneas
+- `_chunk_glossary(section)`: regex `r"^[-\s]*\*{1,2}([^*\n]{1,120})\*{1,2}:?\s*(.+)"` — acepta el prefijo `- ` que el OCR añade a cada entrada
 
-### Sección 1 — Introducción (páginas 5-6)
-**Tipo**: `narrative`
+#### Diseño del flujo de chunkeado (visión previa)
 
-Dos chunks:
-- **Chunk 1.1**: Párrafo de organismos competentes + lista de CSIRTs (CCN-CERT, INCIBE-CERT, CNPIC, ESP-DEF-CERT) con sus ámbitos
-- **Chunk 1.2**: Definición de la guía como referencia estatal y su alineación normativa
+El comportamiento deseado del chunker, antes de implementarlo, es el siguiente:
 
-### Sección 2 — Objeto (páginas 7-9)
-**Tipo**: `narrative` + `criteria_list`
+1. **Entrada del sistema**
+   - **Entrada**: lista de páginas ya convertidas a Markdown por `ocr.py`, en la forma `[(número_página, markdown), ...]`, ordenadas.
+   - **Salida esperada**: lista de objetos `Chunk` listos para indexar en Qdrant.
 
-Tres chunks:
-- **Chunk 2.1**: Objeto del documento + audiencia objetivo (lista de destinatarios)
-- **Chunk 2.2**: Tablas de Autoridad Competente (Tabla 1) — chunk completo con la tabla
-- **Chunk 2.3**: Tabla de CSIRT de referencia (Tabla 2) + ítems que emanan del documento
+2. **Ensamblado con marcadores de página**
+   - El chunker unirá todas las páginas en un único string de Markdown, insertando antes de cada página un marcador HTML del tipo `<!-- page N -->`.
+   - Estos marcadores serán la única fuente de verdad para reconstruir `pagina_inicio` y `pagina_fin` de cada chunk.
 
-### Sección 3 — Alcance (página 10)
-**Tipo**: `narrative`
+3. **Split principal por headings**
+   - El Markdown completo se dividirá en secciones usando únicamente headings de nivel 1 y 2 (`# ` y `## ` al inicio de línea).
+   - Cada sección almacenará:
+     - El texto del heading.
+     - El nivel (`1` o `2`).
+     - El body sin el propio heading.
+     - El rango de páginas (`page_start`, `page_end`) calculado a partir de los marcadores `<!-- page N -->` presentes en el body.
+   - Un posible texto previo al primer heading se tratará como sección especial "Preámbulo".
 
-Un chunk:
-- **Chunk 3.1**: Criterios de notificación obligatoria vs potestativa, con condiciones para cada caso
+4. **Extracción de número de sección**
+   - A partir del texto del heading se extraerán dos campos:
+     - `seccion`: número "top" (`"6"`, `"8"`, `"A1"`, etc.).
+     - `subseccion`: numeración completa cuando exista (`"6.1"`, `"6.1.1"`, etc.).
+   - Si no se detecta numeración, se usará un `sec_id` derivado de un *slug* del heading (`_slugify`) como valor por defecto de `seccion`.
 
-### Sección 4 — Ventanilla Única (páginas 11-13)
-**Tipo**: `procedure`
+5. **Clasificación de la sección (tipo de contenido)**
+   - Para cada sección se decidirá el tipo de chunking según este orden:
+     1. Si la densidad de líneas que cumplen el patrón de glosario `**Término**: definición` es ≥ 25 % → la sección se tratará como **glosario**.
+     2. En caso contrario, si el body contiene tablas Markdown (líneas `| ... |` con separadores `|---|`) → la sección se tratará como **texto con tablas**.
+     3. En el resto de casos → la sección se considerará **narrativa**.
+   - Adicionalmente, para headings de nivel 3 (`###`) dentro del body, el tipo podrá especializarse a `procedure` cuando represente pasos operativos.
 
-Cuatro chunks:
-- **Chunk 4.0**: Descripción general del sistema de ventanilla única (referencia al flujograma)
-- **Chunk 4.1**: Pasos 1-5 del procedimiento de ventanilla única (texto completo del proceso)
-- **Chunk 4.2**: Reporte a CCN-CERT (herramienta LUCIA, email, PGP)
-- **Chunk 4.3**: Reporte a INCIBE-CERT (buzones, RedIRIS, operadores PIC)
-- **Chunk 4.4**: Reporte a ESP-DEF-CERT (canales, URL, urgencia)
+6. **Chunking de secciones narrativas**
+   - Para secciones narrativas, el diseño será:
+     - Primero dividir el body por sub-headings `###` (si los hay), tratando cada bloque como sub-sección lógica.
+     - Para cada bloque:
+       - Si el texto cabe en `MAX_TOKENS` (configurable por `CHUNK_MAX_TOKENS`, por defecto 400) → un único chunk.
+       - Si no cabe → aplicar una **ventana deslizante de tokens** con tamaño `MAX_TOKENS` y solapamiento `OVERLAP_TOKENS` (50 tokens).
+     - Cada ventana generará un `Chunk` con:
+       - `chunk_id` basado en el identificador de sección (`sec_id`) más índices de parte/ventana.
+       - `tipo_contenido` `narrative` (o `procedure` si aplica).
+       - `pagina_inicio` / `pagina_fin` heredados de la sección.
+       - `terminos_clave` y `tokens_aproximados` calculados automáticamente.
 
-### Sección 5 — Taxonomía (páginas 14-17)
-**Tipo**: `table`
+7. **Chunking de secciones con tablas**
+   - Para secciones que contengan tablas:
+     - Se localizarán bloques contiguos de líneas que forman tablas Markdown.
+     - El texto narrativo **antes** de cada bloque de tabla se chunqueará usando la misma estrategia narrativa anterior.
+     - Cada bloque de tabla se convertirá en un `Chunk` independiente con:
+       - `tipo_contenido = "table"`.
+       - `tabla` = nombre normalizado de la tabla (`"Tabla N"` o `"Cuadro N"`), extraído del título antes o después del bloque.
+       - `pagina_inicio` / `pagina_fin` de la sección.
+     - El texto narrativo **después** de la última tabla también se chunqueará como narrativa.
 
-**CRÍTICO**: La Tabla 3 es la taxonomía completa de ciberincidentes. Debe mantenerse como UN ÚNICO chunk o dividirse por categoría, nunca por número de líneas.
+8. **Chunking del glosario**
+   - En secciones detectadas como glosario:
+     - Cada línea/entrada que cumpla `**Término**: definición` generará exactamente un chunk.
+     - El `chunk_id` seguirá el formato `glosario.{slug_del_termino}`.
+     - `tipo_contenido` será `glossary_term`, y el campo `termino_glosario` contendrá el término original.
 
-División recomendada por categorías (para no superar límite de tokens):
-- **Chunk 5.1**: Tabla 3 — Contenido abusivo + Contenido dañino
-- **Chunk 5.2**: Tabla 3 — Obtención de información + Intento de intrusión + Intrusión
-- **Chunk 5.3**: Tabla 3 — Disponibilidad + Compromiso de la información + Fraude
-- **Chunk 5.4**: Tabla 3 — Vulnerable + Otros (incluye APT)
-
-> Cada chunk de tabla incluye en su metadata la referencia `tabla: "Tabla 3"` y `categoria_inicio` / `categoria_fin` para que el agente sepa que es una tabla dividida.
-
-### Sección 6 — Notificación (páginas 18-28)
-**Tipo**: `narrative` + `table` + `criteria_list`
-
-Esta es la sección más densa y crítica. División detallada:
-
-- **Chunk 6.0**: Criterios generales para la notificación (introducción de la sección)
-- **Chunk 6.1**: Nivel de peligrosidad — definición del concepto
-- **Chunk 6.2**: **Tabla 4 completa** — Criterios de determinación del nivel de peligrosidad (CRÍTICO a BAJO). **Nunca fragmentar.**
-- **Chunk 6.3**: Nivel de impacto — definición del concepto + parámetros evaluados (lista de 9 criterios)
-- **Chunk 6.4**: **Tabla 5 — Niveles CRÍTICO y MUY ALTO** con todos sus criterios
-- **Chunk 6.5**: **Tabla 5 — Niveles ALTO, MEDIO, BAJO y SIN IMPACTO** con todos sus criterios
-- **Chunk 6.6**: Niveles con notificación obligatoria (CRÍTICO/MUY ALTO/ALTO) + referencia a normativa
-- **Chunk 6.7**: Interacción con CSIRT de referencia (herramientas, ticketing, email)
-- **Chunk 6.8**: Apertura del incidente — proceso de registro, identificador único
-- **Chunk 6.9**: **Tabla 6 completa** — Información a notificar (todos los campos: Asunto, OSE/PSD, Sector, Fechas, Descripción, Recursos, Origen, Taxonomía, Niveles, Plan de acción, Adjuntos, Regulación, FFCCSE)
-- **Chunk 6.10**: **Tabla 7 completa** — Ventana temporal de reporte (plazos por nivel: inmediata, 24/48/72h, 20/40 días)
-- **Chunk 6.11**: **Tablas 8 y 9** — Estados de cierre + Tiempos de cierre sin respuesta
-
-> **Nota Tabla 5**: Se divide en dos chunks por volumen, pero ambos comparten `tabla: "Tabla 5"` en metadata. El agente debe recuperar ambos para respuestas sobre criterios de impacto.
-
-### Sección 7 — Gestión (páginas 29-32)
-**Tipo**: `procedure`
-
-Un chunk por fase:
-- **Chunk 7.0**: Definición de gestión de ciberincidentes + referencia al flujograma de fases
-- **Chunk 7.1**: Fase de Preparación (3 pilares + puntos clave)
-- **Chunk 7.2**: Fase de Identificación (principios de detección)
-- **Chunk 7.3**: Fase de Contención (triaje, decisiones, acciones)
-- **Chunk 7.4**: Fase de Mitigación (medidas según tipo, recomendaciones)
-- **Chunk 7.5**: Fase de Recuperación (criterios, monitorización post-producción)
-- **Chunk 7.6**: Actuaciones Post-Incidente (lecciones aprendidas, informe final)
-
-### Sección 8 — Métricas (páginas 33-35)
-**Tipo**: `table`
-
-- **Chunk 8.0**: Introducción a métricas e indicadores
-- **Chunk 8.1**: **Tabla 10** — Métrica M1: Alcance del sistema
-- **Chunk 8.2**: **Tablas 11** — Métricas M2 y M3: Resolución de incidentes (ALTO/MUY ALTO/CRÍTICO y BAJO/MEDIO)
-- **Chunk 8.3**: **Tabla 12** — Métrica M4: Recursos consumidos
-- **Chunk 8.4**: **Tabla 13** — Métricas M5 y M6: Gestión de incidentes
-
-### Anexo 1 — Infraestructuras Críticas (páginas 36-39)
-**Tipo**: `procedure` + `narrative`
-
-- **Chunk A1.1**: Introducción y ámbito (CNPIC como autoridad)
-- **Chunk A1.2**: Comunicaciones obligatorias por peligrosidad (CRÍTICO/MUY ALTO/ALTO)
-- **Chunk A1.3**: Comunicaciones obligatorias por impacto
-- **Chunk A1.4**: Comunicación al Ministerio Fiscal y otros organismos
-- **Chunk A1.5**: Descripción de los flujogramas PIC (gestión y respuesta operativa)
-
-### Anexo 2 — Sector Público (página 40)
-**Tipo**: `narrative`
-
-- **Chunk A2.1**: Instrucción Técnica de Seguridad (BOE, Guía CCN-STIC 817) + notificación obligatoria CRÍTICO/MUY ALTO/ALTO al CCN via LUCIA
-
-### Anexo 3 — Sector Privado (página 41)
-**Tipo**: `narrative`
-
-- **Chunk A3.1**: Notificación a INCIBE-CERT para entidades privadas y ciudadanía (Art. 11 RDL 12/2018)
-
-### Anexo 4 — Marco Regulador (páginas 42-44)
-**Tipo**: `legal_reference`
-
-- **Chunk A4.1**: Normativa de carácter general (Código Penal, LOPD, Telecomunicaciones, RDL 12/2018...)
-- **Chunk A4.2**: Normativa Sector Público (CCN, ENS, Ley 40/2015...)
-- **Chunk A4.3**: Normativa Infraestructuras Críticas (Ley 8/2011, RD 704/2011, PNPIC...)
-- **Chunk A4.4**: Normativa Redes Militares y Defensa (RD 998/2017, OM 10/2013...)
-
-### Anexo 5 — Glosario (páginas 45-54)
-**Tipo**: `glossary_term`
-
-Un chunk por término. Aproximadamente 40 chunks con estructura uniforme:
-
-```
-término: "Ransomware"
-definición: "Se engloba bajo este epígrafe a aquel malware que infecta..."
-categoria_glosario: "Contenido Dañino"
-```
-
-Términos agrupados por categoría del glosario:
-- Contenido Abusivo: Spam, Acoso, Extorsión, Mensajes ofensivos, Delito, Pederastia, Racismo, Apología de la violencia
-- Contenido Dañino: Malware, Virus, Gusano, Troyano, Spyware, Rootkit, Dialer, Ransomware, Bot dañino, RAT, C&C, Conexión sospechosa
-- Obtención de Información: Escaneo de puertos, Escaneo de red, Sniffing, Transferencia DNS, Ingeniería social, Phishing, Spear Phishing
-- Intrusiones: Explotación, SQLi, XSS, CSRF, Defacement, RFI/LFI, Evasión, Pharming, Fuerza bruta, Diccionario, Robo de credenciales
-- Disponibilidad: DoS, DDoS, Sabotaje, Inundación SYN/UDP, DNS Open-Resolver, Mala configuración
-- Compromiso de la Información: Acceso no autorizado, Modificación, Borrado, Exfiltración, POODLE/FREAK
-- Fraude: Uso no autorizado, Suplantación, Propiedad intelectual
-- Vulnerabilidades: Tecnología vulnerable, Política de seguridad precaria
-- Otros: Ciberterrorismo, Daños PIC, APT/AVT, Dominios DGA, Criptografía, Proxy
-- General: Ciberseguridad, Ciberespacio, Redes y sistemas, OSE, PSD, Ciberincidente, Taxonomía, RGPD, OpenPGP, Telnet, RDP, VNC, SNMP, Redis, ICMP
+9. **Garantías de diseño**
+   - Las tablas no se dividirán por límite de tokens: siempre se mantendrán completas en un solo chunk.
+   - Las entradas de glosario serán atómicas (un término por chunk).
+   - Todo chunk tendrá:
+     - Un identificador estable (`chunk_id`).
+     - Rango de páginas trazable al PDF original.
+     - Texto autocontenido preparado para ser embebido por el modelo de embeddings.
 
 ---
 
 ## 4. Esquema de Metadatos por Chunk
 
-Cada chunk almacena el siguiente payload en Qdrant:
-
 ```json
 {
-  "chunk_id": "6.9",
-  "seccion": "6",
-  "subseccion": "6.4",
-  "titulo_seccion": "Información a Notificar",
-  "titulo_documento": "Guía Nacional de Notificación y Gestión de Ciberincidentes",
-  "pagina_inicio": 25,
-  "pagina_fin": 26,
-  "tipo_contenido": "table",
-  "tabla": "Tabla 6",
+  "chunk_id":        "sec_6_3_0",
+  "chunk_version":   "1.0",
+  "seccion":         "6",
+  "subseccion":      "6.3",
+  "titulo_seccion":  "Nivel de Impacto",
+  "pagina_inicio":   22,
+  "pagina_fin":      24,
+  "tipo_contenido":  "narrative",
+  "tabla":           null,
   "es_tabla_dividida": false,
-  "categoria_glosario": null,
-  "texto": "...[contenido completo del chunk]...",
-  "tokens_aproximados": 420,
-  "referencias_cruzadas": ["6.1", "6.2", "6.3"],
-  "terminos_clave": ["OSE", "PSD", "taxonomía", "peligrosidad", "impacto", "FFCCSE"]
+  "termino_glosario": null,
+  "ambito":          "general",
+  "texto":           "...[contenido completo del chunk]...",
+  "terminos_clave":  ["impacto", "peligrosidad", "OSE", "PSD"]
 }
 ```
 
-### Campos obligatorios
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `chunk_id` | string | Identificador único (ej. "6.9", "A1.2", "glosario.ransomware") |
-| `seccion` | string | Sección principal del documento |
-| `titulo_seccion` | string | Título legible de la sección |
-| `pagina_inicio` | int | Página de inicio en el PDF |
-| `pagina_fin` | int | Página de fin en el PDF |
-| `tipo_contenido` | enum | `narrative`, `table`, `procedure`, `criteria_list`, `glossary_term`, `legal_reference` |
-| `texto` | string | Contenido completo del chunk |
+### Formato de `chunk_id`
 
-### Campos opcionales pero recomendados
+| Tipo de chunk | Formato | Ejemplo |
+|---|---|---|
+| Chunk narrativo/tabla | `sec_{seccion_idx}_{chunk_idx}` | `sec_6_3`, `sec_6_3_0` |
+| Entrada de glosario | `glosario.{termino_normalizado}` | `glosario.ransomware`, `glosario.apt` |
+
+### Campos relevantes
+
 | Campo | Tipo | Descripción |
 |---|---|---|
-| `tabla` | string | Nombre de la tabla si `tipo_contenido = "table"` |
-| `es_tabla_dividida` | bool | True si la tabla ocupa varios chunks |
-| `parte_tabla` | int | Número de parte si `es_tabla_dividida = true` (1, 2, ...) |
-| `categoria_glosario` | string | Categoría del glosario si `tipo_contenido = "glossary_term"` |
-| `referencias_cruzadas` | list[string] | IDs de chunks relacionados |
-| `terminos_clave` | list[string] | Términos técnicos presentes (para mejorar BM25) |
-| `ambito` | enum | `general`, `sector_publico`, `infraestructuras_criticas`, `sector_privado`, `defensa` |
+| `chunk_id` | string | Identificador único |
+| `seccion` | string | Número de sección del heading H1/H2 detectado |
+| `titulo_seccion` | string | Texto del heading |
+| `pagina_inicio / pagina_fin` | int | Extraído de los marcadores `<!-- page N -->` |
+| `tipo_contenido` | enum | `narrative`, `table`, `glossary_term` |
+| `tabla` | string \| null | `"Tabla N"` normalizado; solo para `tipo_contenido=table` |
+| `termino_glosario` | string \| null | Término para entradas de glosario |
+| `ambito` | enum | `general` por defecto |
+| `terminos_clave` | list[string] | Top-8 palabras clave por frecuencia en el texto del chunk |
 
 ---
 
-## 5. Reglas de Chunking Inviolables
+## 5. Resultado de la Ingesta
 
-1. **Las tablas no se fragmentan por tokens**. Si una tabla supera el límite, se divide por filas completas (nunca partiendo una fila a mitad), manteniendo siempre la cabecera en cada parte.
-
-2. **El glosario es atómico por término**. Cada entrada del glosario es un chunk independiente. Nunca agrupar varios términos en un chunk.
-
-3. **Los procedimientos incluyen su contexto**. Un chunk de tipo `procedure` incluye siempre una frase introductoria que indique a qué procedimiento pertenece (ej: "En el marco del proceso de ventanilla única, paso 3:...").
-
-4. **Overlap permitido solo en narrativa**. Los chunks de tipo `narrative` pueden incluir la última frase del chunk anterior como contexto, pero solo en texto narrativo, nunca en tablas.
-
-5. **Las referencias cruzadas se preservan en metadata**. Si un chunk menciona "consultar Tabla 4", el campo `referencias_cruzadas` incluye el chunk_id de la Tabla 4.
-
----
-
-## 6. Estimación de Chunks
-
-| Sección | Chunks estimados |
+| Métrica | Valor |
 |---|---|
-| Secciones 1-3 | 7 |
-| Sección 4 (Ventanilla) | 5 |
-| Sección 5 (Taxonomía) | 4 |
-| Sección 6 (Notificación) | 12 |
-| Sección 7 (Gestión) | 7 |
-| Sección 8 (Métricas) | 5 |
-| Anexos 1-4 | 14 |
-| Anexo 5 (Glosario) | ~40 |
-| **Total estimado** | **~94 chunks** |
+| Páginas procesadas | 55 |
+| Chunks totales | 212 |
+| Entradas de glosario | ~73 |
+| Tablas con campo `tabla` correcto | 13/13 |
+| Tamaño aprox. del índice en Qdrant | ~1.5 MB |
 
-Para 94 chunks con embeddings de 1536 dimensiones (text-embedding-3-small), el índice completo ocupa aproximadamente **700KB** en Qdrant. Perfectamente manejable en cualquier instancia Docker.
+---
+
+## 6. Reglas Inviolables
+
+1. **Las tablas no se fragmentan por tokens**. Si una tabla supera el límite del contexto del LLM, se incluye completa en un único chunk. La tabla siempre tiene prioridad sobre el límite de tokens.
+
+2. **El glosario es atómico por término**. Cada entrada `**Término**: definición` es un chunk independiente.
+
+3. **El campo `tabla` siempre es `"Tabla N"`** (no el texto completo del pie). `get_table` filtra por `MatchValue` en Qdrant — el formato normalizado es crítico.
+
+4. **El caché OCR no se borra entre arranques**. Re-ingestar sin borrar `data/markdown_cache/` solo llama a la API de embeddings, no al modelo de visión.
+
+5. **Para forzar re-OCR**: `rm -rf data/markdown_cache/` antes de ejecutar `docker compose run --rm ingest`.
+
+---
+
+## 7. Configuración por Variables de Entorno
+
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `OCR_MODEL` | `gpt-5.2-2025-12-11` | Modelo de visión para OCR |
+| `OCR_CONCURRENCY` | `5` | Páginas procesadas en paralelo |
+| `MARKDOWN_CACHE_DIR` | `data/markdown_cache` | Directorio de caché OCR en disco |
+| `PDF_PATH` | `data/guia_nacional_notificacion_gestion_ciberincidentes.pdf` | Ruta al PDF fuente |

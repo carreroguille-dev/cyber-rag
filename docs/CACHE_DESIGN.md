@@ -154,6 +154,7 @@ async def cache_lookup(query: str, threshold: float = 0.92) -> str | None:
     results = qdrant_client.query_points(
         collection_name="qa_cache",
         query=embedding,
+        using="dense",
         limit=1,
         score_threshold=threshold,
         with_payload=True
@@ -185,7 +186,7 @@ async def cache_store(query: str, respuesta: str, metadata: dict) -> None:
         collection_name="qa_cache",
         points=[{
             "id": str(uuid.uuid4()),
-            "vector": embedding,
+            "vector": {"dense": embedding},
             "payload": {
                 "pregunta_original": query,
                 "respuesta": respuesta,

@@ -9,9 +9,8 @@
 |---|---|---|
 | Modelo | `gpt-5.1` | Capacidad de razonamiento multi-paso y tool calling nativo |
 | Max tokens respuesta | 2048 | Suficiente para síntesis con citas, evita respuestas excesivamente largas |
-| Temperature | 0.0 | Respuestas deterministas para un documento normativo |
 | Max tool calls por query | 8 | Límite de seguridad para evitar loops infinitos |
-| Timeout total | 30s | SLA razonable para queries complejas |
+| Timeout total | 90s | Necesario para queries que requieren 5-6 tool calls encadenados |
 
 ---
 

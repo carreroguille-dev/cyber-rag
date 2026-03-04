@@ -307,6 +307,12 @@ cyber-rag/
 
 ---
 
+## Diario de desarrollo
+
+El proceso de diseño y resolución está documentado en [`DEVLOG.md`](DEVLOG.md).
+
+---
+
 ## Inicio rápido
 
 **Requisitos previos:** Docker, una clave de API de OpenAI y el PDF en `data/`.

@@ -9,7 +9,7 @@ Se utilizan **dos colecciones Qdrant** en la misma instancia:
 
 | Colección | Propósito | Nº vectores estimado |
 |---|---|---|
-| `guia_chunks` | Knowledge base del PDF indexado | ~94 |
+| `guia_chunks` | Knowledge base del PDF indexado | ~212 |
 | `qa_cache` | Caché semántica de preguntas respondidas | Crece con el uso |
 
 Ambas colecciones comparten la misma instancia Qdrant pero son completamente independientes. El modelo de embeddings debe ser el mismo en ambas para que las distancias cosine sean comparables.
@@ -31,14 +31,16 @@ from qdrant_client.models import (
 collection_config = {
     "collection_name": "guia_chunks",
     
-    # Vector denso (embeddings semánticos)
-    "vectors_config": VectorParams(
-        size=1536,           
-        distance=Distance.COSINE,
-        on_disk=False        
-    ),
-    
-    # Vector disperso (BM25 léxico)
+    # Vector denso con nombre (embeddings semánticos)
+    "vectors_config": {
+        "dense": VectorParams(
+            size=1536,
+            distance=Distance.COSINE,
+            on_disk=False
+        )
+    },
+
+    # Vector disperso con nombre (BM25 léxico)
     "sparse_vectors_config": {
         "bm25": SparseVectorParams(
             index=SparseIndexParams(on_disk=False)
@@ -191,37 +193,44 @@ results = client.scroll(
 ```
 
 #### Query D — Expansión de contexto
-Para obtener chunks vecinos a un chunk dado (contexto circundante):
+Para obtener chunks vecinos a un chunk dado en función de página:
 
 ```python
 # get_context_window(chunk_id, window=2)
-# Se recuperan los chunks con IDs numéricos adyacentes
-# Ejemplo: chunk_id="6.5", window=2 → recupera 6.3, 6.4, 6.5, 6.6, 6.7
+# Recupera chunks cuyo rango de páginas se solapa con ± window páginas
+# del chunk de referencia. Funciona con cualquier formato de chunk_id.
 
 def get_context_window(chunk_id: str, window: int = 2):
-    seccion, num = chunk_id.rsplit(".", 1)
-    num = int(num)
-    
-    ids_objetivo = [
-        f"{seccion}.{i}" 
-        for i in range(max(0, num - window), num + window + 1)
-    ]
-    
+    # 1. Obtener la página del chunk de referencia
+    ref = client.scroll(
+        collection_name="guia_chunks",
+        scroll_filter=models.Filter(
+            must=[models.FieldCondition(
+                key="chunk_id", match=models.MatchValue(value=chunk_id)
+            )]
+        ),
+        limit=1, with_payload=True, with_vectors=False
+    )
+    if not ref[0]:
+        return []
+    ref_page = ref[0][0].payload["pagina_inicio"]
+
+    # 2. Recuperar chunks en el rango de páginas adyacente
     results = client.scroll(
         collection_name="guia_chunks",
         scroll_filter=models.Filter(
             must=[
                 models.FieldCondition(
-                    key="chunk_id",
-                    match=models.MatchAny(any=ids_objetivo)
+                    key="pagina_inicio",
+                    range=models.Range(gte=ref_page - window, lte=ref_page + window)
                 )
             ]
         ),
-        limit=len(ids_objetivo),
+        limit=50,
         with_payload=True,
         with_vectors=False
     )
-    return sorted(results, key=lambda x: x.payload["chunk_id"])
+    return sorted(results[0], key=lambda x: x.payload["pagina_inicio"])
 ```
 
 #### Query E — Búsqueda en glosario
@@ -256,13 +265,16 @@ results = client.query_points(
 ```python
 cache_collection_config = {
     "collection_name": "qa_cache",
-    
-    "vectors_config": VectorParams(
-        size=1536,
-        distance=Distance.COSINE,
-        on_disk=False
-    ),
-    
+
+    # Vector con nombre (igual que guia_chunks para consistencia)
+    "vectors_config": {
+        "dense": VectorParams(
+            size=1536,
+            distance=Distance.COSINE,
+            on_disk=False
+        )
+    },
+
     # El caché no necesita BM25, solo similitud semántica de preguntas
     "hnsw_config": HnswConfigDiff(
         m=16,
@@ -320,6 +332,7 @@ def cache_lookup(query_embedding, threshold: float = 0.92):
     results = client.query_points(
         collection_name="qa_cache",
         query=query_embedding,
+        using="dense",   # colección usa vectores con nombre
         limit=1,
         score_threshold=threshold,
         with_payload=True
@@ -350,7 +363,7 @@ def cache_store(query: str, query_embedding, respuesta: str, metadata: dict):
         points=[
             models.PointStruct(
                 id=str(uuid.uuid4()),
-                vector=query_embedding,
+                vector={"dense": query_embedding},   # vector con nombre obligatorio
                 payload={
                     "pregunta_original": query,
                     "pregunta_normalizada": normalizar(query),
@@ -397,7 +410,7 @@ volumes:
 
 ### 4.2 Política de Backup
 
-Para ~94 chunks del PDF (colección estática), el backup es trivial:
+Para ~212 chunks del PDF (colección estática), el backup es trivial:
 - La colección `guia_chunks` no cambia salvo actualización del documento. Snapshot manual tras la ingesta inicial.
 - La colección `qa_cache` crece con el uso. Snapshot automático diario recomendado.
 
@@ -416,7 +429,7 @@ client.create_snapshot(collection_name="qa_cache")
 **Opción A — OpenAI text-embedding-3-small** (recomendada si hay acceso a API):
 - Dimensiones: 1536
 - Coste: $0.02 / 1M tokens
-- Para 94 chunks × 500 tokens promedio = 47.000 tokens → $0.001 (ingesta única)
+- Para 212 chunks × ~400 tokens promedio = ~85.000 tokens → ~$0.002 (ingesta única)
 - Muy buena calidad en español técnico
 
 **Opción B — nomic-embed-text** (open source, self-hosted):

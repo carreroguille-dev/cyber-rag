@@ -50,12 +50,12 @@ Conocer el documento es esencial para diseñar correctamente el sistema.
 │  Capa 1 — Reglas deterministas (regex + keywords)              │
 │  Capa 2 — Clasificador LLM ligero                              │
 │                                                                 │
-│  Salidas: VALID | ORIENTED | REJECTED                          │
+│  Salidas: PASS | REJECT                                        │
 └──────────────┬──────────────────┬──────────────────────────────┘
-               │ VALID            │ ORIENTED / REJECTED
+               │ PASS             │ REJECT
                ▼                  ▼
 ┌──────────────────────┐   Mensaje al usuario
-│   CACHÉ SEMÁNTICA    │   (orientación o rechazo estándar)
+│   CACHÉ SEMÁNTICA    │   (rechazo estándar opaco)
 │   (RAG Clásico)      │
 │                      │
 │  Colección: qa_cache │
@@ -72,10 +72,10 @@ Conocer el documento es esencial para diseñar correctamente el sistema.
                           │                                     │
                           │  Tools disponibles:                 │
                           │  • hybrid_search()                  │
-                          │  • keyword_search()                 │
+                          │  • get_table()                      │
                           │  • get_section()                    │
                           │  • get_context_window()             │
-                          │  • get_table()                      │
+                          │  • glossary_lookup()                │
                           └─────────────┬───────────────────────┘
                                         │
                                         ▼
@@ -107,7 +107,8 @@ Conocer el documento es esencial para diseñar correctamente el sistema.
 | Guardrail | **gpt-5-nano** + reglas | Modelo ligero y económico, suficiente para clasificación ternaria |
 | Agente RAG | **gpt-5.1** | Capacidad de razonamiento multi-paso, tool calling nativo |
 | Embeddings | **text-embedding-3-small** (OpenAI) | Buena relación calidad/coste para español técnico |
-| Parser PDF | **PyMuPDF (fitz)** | Mejor preservación de tablas y estructura para PDFs normativos |
+| Renderizado PDF | **PyMuPDF (fitz)** | Conversión de páginas a PNG para el OCR por visión |
+| OCR | **gpt-5.2-2025-12-11** (visión) | Convierte imágenes de página a Markdown estructurado; caché en disco |
 | Orquestación | **Python** + Qdrant SDK + OpenAI SDK | Stack mínimo sin frameworks de alto nivel que oculten la lógica |
 
 > **Nota sobre frameworks**: Se evita deliberadamente LangChain o LlamaIndex para mantener control total sobre el comportamiento del agente. Para un documento normativo donde la precisión es crítica, la transparencia del código supera la comodidad del framework.
@@ -116,17 +117,17 @@ Conocer el documento es esencial para diseñar correctamente el sistema.
 
 ## 5. Decisiones de Diseño y Justificación
 
-### 5.1 Chunking por sección semántica, no por tokens
-El documento tiene jerarquía clara y secciones cortas. Fragmentar por número fijo de tokens rompe tablas y referencias cruzadas. Cada chunk respeta los límites naturales de sección/subsección/tabla.
+### 5.1 OCR por visión en lugar de extracción de texto con PyMuPDF
+PDFs normativos con tablas complejas no producen texto limpio con extracción directa. El modelo de visión genera Markdown estructurado que preserva cabeceras, tablas y listas. La caché en disco evita llamadas repetidas al API en re-ingestas.
 
-### 5.2 Búsqueda híbrida obligatoria
+### 5.2 Chunker agnóstico al documento
+El chunker detecta el tipo de contenido por estructura Markdown (headings H1/H2, `|---|`, densidad de `**Término**:`), no por conocimiento previo del documento. Cualquier PDF procesado por el mismo OCR se puede indexar sin cambios de código.
+
+### 5.3 Búsqueda híbrida obligatoria
 El dominio (ciberseguridad normativa española) combina texto narrativo con términos exactos (siglas, nombres de organismos, artículos legales). La búsqueda solo semántica "suaviza" términos técnicos y puede mezclar conceptos similares. BM25 ancla los términos exactos.
 
-### 5.3 Umbral de caché conservador (0.92)
+### 5.4 Umbral de caché conservador (0.92)
 En un documento normativo, una respuesta ligeramente incorrecta puede tener consecuencias legales (plazos de notificación, organismos a los que reportar). Se prefiere un umbral alto que garantice precisión sobre un umbral bajo que maximice hit rate.
-
-### 5.4 Mensaje de orientación para queries de ciberseguridad general
-El guardrail distingue entre queries completamente ajenas al dominio (rechazo directo) y queries de ciberseguridad general no cubiertas por el PDF (orientación sin responder). Esto mejora la experiencia sin añadir riesgo de respuestas incorrectas.
 
 ### 5.5 Separación de modelos: gpt-5-nano para guardrail, gpt-5.1 para agente
 El guardrail es una tarea de clasificación simple. Usar el mismo modelo potente que el agente RAG para esta tarea sería un desperdicio económico y de latencia. gpt-5-nano es suficiente para clasificación ternaria con alta precisión.
@@ -156,16 +157,10 @@ razonamiento sobre tablas + texto) → Síntesis con múltiples citas →
 Guardado en caché → Respuesta en ~8-12s
 ```
 
-### Flujo 4: Query de ciberseguridad general
+### Flujo 4: Prompt injection
 ```
-Query → Guardrail (ORIENTED) → Mensaje de orientación → Fin
-(sin acceso al RAG, sin coste de gpt-5.1)
-```
-
-### Flujo 5: Prompt injection
-```
-Query → Guardrail Capa 1 (Regex HIT) → Mensaje estándar → Fin
-(sin llamada al LLM, coste cero)
+Query → Guardrail Capa 1 (Regex HIT) → Mensaje opaco → Fin
+(coste cero de LLM)
 ```
 
 ---
@@ -198,10 +193,12 @@ Query → Guardrail Capa 1 (Regex HIT) → Mensaje estándar → Fin
 │
 ├── src/
 │   ├── ingestion/
-│   │   ├── parser.py            ← Extracción estructurada del PDF
-│   │   ├── chunker.py           ← Lógica de chunking semántico
-│   │   └── indexer.py           ← Carga en Qdrant
+│   │   ├── pdf_renderer.py      ← PDF → páginas PNG (PyMuPDF)
+│   │   ├── ocr.py               ← PNG → Markdown (gpt-5.2 visión + caché disco)
+│   │   ├── chunker.py           ← Markdown → objetos Chunk (heading-aware)
+│   │   └── indexer.py           ← Orquestador: OCR → chunk → embed → upsert
 │   ├── guardrail/
+│   │   ├── __init__.py          ← guardrail() unificado con logs de timing
 │   │   ├── rules.py             ← Capa 1: reglas deterministas
 │   │   └── classifier.py        ← Capa 2: clasificador gpt-5-nano
 │   ├── retrieval/
@@ -214,7 +211,9 @@ Query → Guardrail Capa 1 (Regex HIT) → Mensaje estándar → Fin
 │   │   └── semantic_cache.py    ← Lógica de caché semántica
 │   ├── ui/
 │   │   └── app.py               ← Interfaz Gradio (chat)
-│   └── main.py                  ← Punto de entrada del sistema
+│   ├── main.py                  ← Punto de entrada CLI (--ingest, --version, UI)
+│   └── ui/
+│       └── app.py               ← Interfaz de chat Gradio
 │
 ├── data/
 │   └── guia_nacional_ciberincidentes.pdf
